@@ -1,0 +1,9 @@
+{
+  "shop_id": "PUT_YOUR_SHOP_ID_HERE",
+  "blueprint_id": "PUT_A_BLUEPRINT_ID_HERE",
+  "print_provider_id": "PUT_A_PRINT_PROVIDER_ID_HERE",
+  "variant_ids": ["PUT_VARIANT_IDS_HERE"],
+  "price_cents": 1999,
+  "publish": false,
+  "_instructions": "Run list_catalog.py to find real values for the fields above, then delete this _instructions key."
+}
