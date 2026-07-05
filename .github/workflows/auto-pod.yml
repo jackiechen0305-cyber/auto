@@ -1,0 +1,42 @@
+name: Auto POD agent
+
+on:
+  schedule:
+    # Runs every Monday and Thursday at 10:00 UTC. Edit to change frequency.
+    - cron: "0 10 * * 1,4"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  create-product:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install DejaVu fonts
+        run: sudo apt-get update && sudo apt-get install -y fonts-dejavu-core
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Generate design and create product
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          PRINTIFY_API_TOKEN: ${{ secrets.PRINTIFY_API_TOKEN }}
+        run: python generate_and_list.py
+
+      - name: Commit updated state
+        run: |
+          git config user.name "auto-pod-agent"
+          git config user.email "actions@users.noreply.github.com"
+          git add niches.json history.json
+          git diff --quiet --cached || git commit -m "chore: log run and update niche rotation"
+          git push
