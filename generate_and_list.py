@@ -1,27 +1,33 @@
 """
-Autonomous POD agent.
+Autonomous POD agent - structured like a small company.
 
-What it does, in order:
-1. Runs a trend scan (trend_scan.py) using Claude + live web search to find
-   a timely niche opportunity. Falls back to rotating through niches.json
-   if the scan fails or the API call errors out.
-2. Asks Claude for an original slogan + product title/description/tags for
-   that niche, explicitly avoiding any risky terms the trend scan flagged.
-3. Runs the slogan past a lightweight safety check (built-in blocklist +
-   flagged terms) before doing anything with it.
-4. Renders the slogan into a print-ready PNG design (design_renderer.py)
-5. Uploads the design to Printify and creates a product from it using the
-   blueprint/provider/variants in product_config.json
-6. Publishes it to your connected shop if "publish": true in the config
-   (otherwise it's created but left unpublished so you can review it first)
-7. Logs everything to history.json so you have a record and so future runs
-   avoid repeating the same niche or slogan.
+Departments, in pipeline order:
+1. RESEARCH TEAM (research_team.py) - three researchers investigate
+   different angles, a lead reviewer picks the strongest niche + category.
+2. CATALOG TEAM (catalog_team.py) - two independent checkers verify real
+   Printify blueprint/provider/variant options live, with a tiebreaker.
+3. CREATIVE TEAM (creative_team.py) - three copywriters with different
+   styles each pitch a concept; a creative director picks the winner.
+4. COMPLIANCE (compliance_team.py) - an independent reviewer checks the
+   winning concept for trademark/IP risk and appropriateness, on top of a
+   hardcoded blocklist. If rejected, the creative team gets ONE retry with
+   the reviewer's concerns; if the retry also fails review, the run stops
+   and logs why. The reviewer failing-closed means an error never
+   accidentally approves anything.
+5. PRICING (compliance_team.py) - reads real per-unit costs from Printify
+   and sets a margin-based retail price per product, instead of one
+   hardcoded price for everything.
+6. PRODUCTION - renders the design, uploads it, creates the product, and
+   publishes if "publish": true.
+7. RECORDS - everything each team decided (including disagreements and
+   rejections) is logged to history.json for audit.
 
 Required environment variables (set as GitHub Actions secrets):
   ANTHROPIC_API_KEY
   PRINTIFY_API_TOKEN
 
-Config: product_config.json (fill this in using list_catalog.py first)
+Config: product_config.json (shop_id, fallback price_cents, publish,
+allowed_product_categories, optional margin_multiplier)
 """
 
 import base64
@@ -35,7 +41,10 @@ from pathlib import Path
 import requests
 
 from design_renderer import render_design
-from trend_scan import get_trending_niche
+from research_team import run_research_team
+from catalog_team import verify_catalog_choice
+from creative_team import run_creative_team
+from compliance_team import compliance_review, compute_price_cents
 
 ROOT = Path(__file__).parent
 NICHES_PATH = ROOT / "niches.json"
@@ -54,22 +63,6 @@ BUILTIN_BLOCKLIST = [
     "nike", "adidas", "disney", "marvel", "star wars", "pokemon", "harry potter",
     "taylor swift", "nba", "nfl", "mlb", "nhl",
 ]
-
-SYSTEM_PROMPT = """You write original, family-friendly slogans for print-on-demand products (t-shirts, \
-mugs, etc). Given a niche, output ONLY valid JSON (no markdown fences, no commentary) with this exact shape:
-
-{"slogan": "a short punchy original slogan, under 6 words, no copyrighted phrases or song lyrics", \
-"product_title": "SEO-friendly product listing title", "description": "a 2-3 sentence product description", \
-"tags": ["tag1", "tag2"], "text_color": "#111111", "bg_color": null}
-
-Rules:
-- The slogan must be entirely original wording - never quote or closely paraphrase a known song lyric, \
-movie line, book quote, or existing trademarked slogan.
-- Do not reference real brand names, celebrities, sports teams, or copyrighted characters.
-- Keep it appropriate for a general audience.
-- text_color should be a hex string readable on most garment colors (dark colors work best on light \
-shirts and vice versa - default to a single solid dark or white color).
-"""
 
 
 def load_json(path, default=None):
@@ -91,35 +84,6 @@ def pick_niche(niches):
     for n in niches:
         n["used"] = False
     return niches[0]
-
-
-def generate_concept(niche_text, avoid_terms=None, recent_slogans=None):
-    user_msg = f"Niche: {niche_text}"
-    if avoid_terms:
-        user_msg += f"\nDo not use or reference these terms in any way: {', '.join(avoid_terms)}"
-    if recent_slogans:
-        user_msg += f"\nDon't repeat these recent slogans, make it genuinely different: {', '.join(recent_slogans)}"
-
-    resp = requests.post(
-        "https://api.anthropic.com/v1/messages",
-        headers={
-            "x-api-key": ANTHROPIC_API_KEY,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        },
-        json={
-            "model": "claude-sonnet-4-6",
-            "max_tokens": 500,
-            "system": SYSTEM_PROMPT,
-            "messages": [{"role": "user", "content": user_msg}],
-        },
-        timeout=60,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    text_block = next((b["text"] for b in data["content"] if b["type"] == "text"), "{}")
-    cleaned = re.sub(r"^```json|^```|```$", "", text_block.strip(), flags=re.MULTILINE).strip()
-    return json.loads(cleaned)
 
 
 def safety_check(concept, extra_blocked_terms=None):
@@ -144,20 +108,20 @@ def upload_design(png_path, file_name):
     return resp.json()["id"]
 
 
-def create_product(config, concept, image_id):
+def create_product(config, product_type_config, concept, image_id, price_cents):
     shop_id = config["shop_id"]
     payload = {
         "title": concept["product_title"],
         "description": concept["description"],
-        "blueprint_id": int(config["blueprint_id"]),
-        "print_provider_id": int(config["print_provider_id"]),
+        "blueprint_id": int(product_type_config["blueprint_id"]),
+        "print_provider_id": int(product_type_config["print_provider_id"]),
         "variants": [
-            {"id": int(vid), "price": config["price_cents"], "is_enabled": True}
-            for vid in config["variant_ids"]
+            {"id": int(vid), "price": price_cents, "is_enabled": True}
+            for vid in product_type_config["variant_ids"]
         ],
         "print_areas": [
             {
-                "variant_ids": [int(vid) for vid in config["variant_ids"]],
+                "variant_ids": [int(vid) for vid in product_type_config["variant_ids"]],
                 "placeholders": [
                     {
                         "position": "front",
@@ -198,44 +162,103 @@ def main():
         sys.exit(1)
 
     config = load_json(CONFIG_PATH)
-    if "PUT_" in json.dumps(config):
-        print("product_config.json still has placeholder values. Run list_catalog.py and fill it in first.")
+    if "PUT_" in json.dumps(config) or not config.get("allowed_product_categories"):
+        print("product_config.json still has placeholder values, or has no allowed_product_categories "
+              "configured. Fill those in first (see README).")
         sys.exit(1)
 
+    allowed_categories = config["allowed_product_categories"]
     history = load_json(HISTORY_PATH, default=[])
-    recent_niches = [h["niche"] for h in history[-10:]]
+    recent_niches = [h["niche"] for h in history[-10:] if h.get("niche")]
     recent_slogans = [h["slogan"] for h in history[-10:] if h.get("slogan")]
+    run_record = {"timestamp": datetime.now(timezone.utc).isoformat()}
 
+    # ---- 1. RESEARCH TEAM ----
     avoid_terms = []
-    trend = get_trending_niche(ANTHROPIC_API_KEY, recent_niches=recent_niches)
-    if trend and trend.get("niche"):
-        niche_text = trend["niche"]
-        avoid_terms = trend.get("avoid_terms", [])
-        source = "trend scan"
-        print(f"Trend scan picked: {niche_text}  ({trend.get('reasoning', '')})")
+    team_result = run_research_team(ANTHROPIC_API_KEY, allowed_categories, recent_niches=recent_niches)
+    if team_result and team_result.get("niche"):
+        niche_text = team_result["niche"]
+        chosen_category = team_result["product_type"]
+        avoid_terms = team_result.get("avoid_terms", [])
+        run_record["source"] = "research team"
+        run_record["team_notes"] = team_result.get("team_notes", "")
+        print(f"[Research] {niche_text} -> {chosen_category}  ({team_result.get('reasoning', '')})")
     else:
         niches = load_json(NICHES_PATH, default=[])
         niche_entry = pick_niche(niches)
         niche_text = niche_entry["niche"]
-        source = "fallback rotation"
-        print(f"Using fallback niche rotation: {niche_text}")
+        chosen_category = allowed_categories[0]
+        run_record["source"] = "fallback rotation"
+        print(f"[Research] team failed - fallback: {niche_text} -> {chosen_category}")
         niche_entry["used"] = True
         save_json(NICHES_PATH, niches)
+    run_record["niche"] = niche_text
+    run_record["product_type"] = chosen_category
 
-    concept = generate_concept(niche_text, avoid_terms=avoid_terms, recent_slogans=recent_slogans)
-    print(f"Slogan: {concept['slogan']}")
-
-    problems = safety_check(concept, extra_blocked_terms=avoid_terms)
-    if problems:
-        print(f"Safety check flagged terms {problems} - skipping this run without creating a product.")
-        history.append({
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "niche": niche_text, "source": source, "slogan": concept.get("slogan"),
-            "status": "blocked_by_safety_check", "flagged_terms": problems,
-        })
+    # ---- 2. CATALOG TEAM ----
+    catalog_config, catalog_notes = verify_catalog_choice(ANTHROPIC_API_KEY, PRINTIFY_API_TOKEN, chosen_category)
+    run_record["catalog_notes"] = catalog_notes
+    print(f"[Catalog] {catalog_notes}")
+    if not catalog_config:
+        run_record["status"] = "catalog_team_failed"
+        history.append(run_record)
         save_json(HISTORY_PATH, history)
+        print(f"[Catalog] no usable product found for '{chosen_category}' - stopping this run.")
         sys.exit(1)
+    run_record["catalog_pick"] = catalog_config
 
+    # ---- 3. CREATIVE TEAM + 4. COMPLIANCE (with one retry) ----
+    concept = None
+    compliance_details = None
+    extra_avoid = list(avoid_terms)
+    for attempt in (1, 2):
+        candidate = run_creative_team(
+            ANTHROPIC_API_KEY, niche_text, avoid_terms=extra_avoid, recent_slogans=recent_slogans
+        )
+        if not candidate:
+            break
+        print(f"[Creative] attempt {attempt}: \"{candidate['slogan']}\"  ({candidate.get('director_notes', '')})")
+
+        blocklist_hits = safety_check(candidate, extra_blocked_terms=avoid_terms)
+        approved, review = compliance_review(ANTHROPIC_API_KEY, candidate)
+        print(f"[Compliance] approved={approved and not blocklist_hits}  "
+              f"blocklist_hits={blocklist_hits}  reviewer: {review.get('reasoning', '')}")
+
+        if approved and not blocklist_hits:
+            concept = candidate
+            compliance_details = review
+            break
+
+        # feed the concerns back for one retry
+        extra_avoid = list(set(extra_avoid + blocklist_hits + review.get("concerns", [])))
+
+    if not concept:
+        run_record["status"] = "blocked_by_compliance"
+        run_record["compliance"] = compliance_details or {"reasoning": "creative team produced nothing usable"}
+        history.append(run_record)
+        save_json(HISTORY_PATH, history)
+        print("[Compliance] concept rejected twice - stopping this run without creating a product.")
+        sys.exit(1)
+    run_record["slogan"] = concept["slogan"]
+    run_record["compliance"] = compliance_details
+
+    # ---- 5. PRICING ----
+    price_cents = compute_price_cents(
+        PRINTIFY_API_TOKEN,
+        catalog_config["blueprint_id"],
+        catalog_config["print_provider_id"],
+        catalog_config["variant_ids"],
+        margin_multiplier=config.get("margin_multiplier", 2.2),
+    )
+    if price_cents is None:
+        price_cents = config.get("price_cents", 1999)
+        run_record["pricing"] = {"source": "config fallback", "price_cents": price_cents}
+        print(f"[Pricing] could not read costs - falling back to config price {price_cents}c")
+    else:
+        run_record["pricing"] = {"source": "cost-based", "price_cents": price_cents}
+        print(f"[Pricing] cost-based retail price: {price_cents}c")
+
+    # ---- 6. PRODUCTION ----
     design_path = ROOT / "design_output.png"
     render_design(
         concept["slogan"],
@@ -243,28 +266,23 @@ def main():
         text_color=concept.get("text_color", "#111111"),
         bg_color=concept.get("bg_color"),
     )
-
     image_id = upload_design(design_path, f"{niche_text[:30].replace(' ', '_')}.png")
-    product = create_product(config, concept, image_id)
-    print(f"Created product id={product['id']}")
+    product = create_product(config, catalog_config, concept, image_id, price_cents)
+    print(f"[Production] created {chosen_category} product id={product['id']}")
 
     published = False
     if config.get("publish"):
         publish_product(config["shop_id"], product["id"])
         published = True
-        print("Published to connected shop.")
+        print("[Production] published to connected shop.")
     else:
-        print("Created as unpublished draft (set \"publish\": true in product_config.json to auto-publish).")
+        print("[Production] created as unpublished draft (set \"publish\": true to auto-publish).")
 
-    history.append({
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "niche": niche_text,
-        "source": source,
-        "slogan": concept.get("slogan"),
-        "product_id": product.get("id"),
-        "published": published,
-        "status": "created",
-    })
+    # ---- 7. RECORDS ----
+    run_record["product_id"] = product.get("id")
+    run_record["published"] = published
+    run_record["status"] = "created"
+    history.append(run_record)
     save_json(HISTORY_PATH, history)
 
 
