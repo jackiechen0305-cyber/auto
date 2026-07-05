@@ -1,0 +1,48 @@
+name: Look up Printify catalog IDs
+
+# Manually triggered helper - run this from the Actions tab whenever you need
+# to find a shop_id, blueprint_id, print_provider_id, or variant_id, without
+# needing Python installed on your own computer.
+
+on:
+  workflow_dispatch:
+    inputs:
+      command:
+        description: "What to look up"
+        required: true
+        default: "shops"
+        type: choice
+        options:
+          - shops
+          - blueprints
+          - providers
+          - variants
+      blueprint_id:
+        description: "Blueprint ID (needed for 'providers' and 'variants')"
+        required: false
+        default: ""
+      print_provider_id:
+        description: "Print provider ID (needed for 'variants')"
+        required: false
+        default: ""
+
+jobs:
+  lookup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run lookup
+        env:
+          PRINTIFY_API_TOKEN: ${{ secrets.PRINTIFY_API_TOKEN }}
+        run: |
+          python list_catalog.py ${{ inputs.command }} ${{ inputs.blueprint_id }} ${{ inputs.print_provider_id }}
